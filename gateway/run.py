@@ -8577,6 +8577,10 @@ class GatewayRunner:
             proxy_url, (session_id or "")[:20], _elapsed, len(full_response),
         )
 
+        _sc_delivered = (
+            _stream_consumer is not None
+            and getattr(_stream_consumer, "final_response_sent", False)
+        )
         return {
             "final_response": full_response or "(No response from remote agent)",
             "messages": [
@@ -8588,6 +8592,7 @@ class GatewayRunner:
             "history_offset": len(history),
             "session_id": session_id,
             "response_previewed": _stream_consumer is not None and bool(full_response),
+            "already_sent": _sc_delivered,
         }
 
     # ------------------------------------------------------------------

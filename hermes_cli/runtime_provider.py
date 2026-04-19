@@ -217,13 +217,26 @@ def _resolve_runtime_from_pool_entry(
 
 def resolve_requested_provider(requested: Optional[str] = None) -> str:
     """Resolve provider request from explicit arg, config, then env."""
-    if requested and requested.strip():
+    if requested and requested.strip() and requested.strip().lower() != "auto":
         return requested.strip().lower()
 
     model_cfg = _get_model_config()
     cfg_provider = model_cfg.get("provider")
-    if isinstance(cfg_provider, str) and cfg_provider.strip():
+    if isinstance(cfg_provider, str) and cfg_provider.strip() and cfg_provider.strip().lower() != "auto":
         return cfg_provider.strip().lower()
+
+    # Auto-detect custom provider from model name prefix.
+    # "antigravity-manager/claude-sonnet-4-6" → provider "antigravity-manager"
+    model_name = (model_cfg.get("default") or "").strip()
+    if "/" in model_name:
+        prefix = _normalize_custom_provider_name(model_name.split("/", 1)[0])
+        if prefix:
+            config = load_config()
+            custom_providers = config.get("custom_providers")
+            if isinstance(custom_providers, list):
+                for entry in custom_providers:
+                    if isinstance(entry, dict) and _normalize_custom_provider_name(entry.get("name", "")) == prefix:
+                        return prefix
 
     # Prefer the persisted config selection over any stale shell/.env
     # provider override so chat uses the endpoint the user last saved.

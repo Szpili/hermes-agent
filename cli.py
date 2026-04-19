@@ -1732,9 +1732,10 @@ class HermesCLI:
         self._explicit_base_url = base_url
 
         # Provider selection is resolved lazily at use-time via _ensure_runtime_credentials().
+        _cfg_provider = CLI_CONFIG["model"].get("provider", "")
         self.requested_provider = (
             provider
-            or CLI_CONFIG["model"].get("provider")
+            or (_cfg_provider if _cfg_provider and _cfg_provider != "auto" else "")
             or os.getenv("HERMES_INFERENCE_PROVIDER")
             or "auto"
         )
@@ -2199,8 +2200,30 @@ class HermesCLI:
 
     def _normalize_model_for_provider(self, resolved_provider: str) -> bool:
         """Normalize provider-specific model IDs and routing."""
+        from hermes_cli.runtime_provider import _normalize_custom_provider_name
+
         current_model = (self.model or "").strip()
         changed = False
+
+        # Strip custom provider prefix from model name.
+        # "antigravity-manager/claude-sonnet-4-6" → "claude-sonnet-4-6"
+        if resolved_provider == "custom" and "/" in current_model:
+            source = self._provider_source or ""
+            # Extract custom provider name from source formats:
+            #   "custom_provider:antigravity-manager"
+            #   "pool:custom:antigravity-manager"
+            cp_name = ""
+            if source.startswith("custom_provider:"):
+                cp_name = source.split(":", 1)[1]
+            elif source.startswith("pool:custom:"):
+                cp_name = source.split(":", 2)[2] if source.count(":") >= 2 else ""
+            if cp_name:
+                cp_name = _normalize_custom_provider_name(cp_name)
+                model_prefix = _normalize_custom_provider_name(current_model.split("/", 1)[0])
+                if cp_name == model_prefix:
+                    self.model = current_model.split("/", 1)[1]
+                    current_model = self.model
+                    changed = True
 
         try:
             from hermes_cli.model_normalize import (

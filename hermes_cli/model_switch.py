@@ -1103,6 +1103,14 @@ def list_authenticated_providers(
             default_model = (entry.get("model") or "").strip()
             if default_model and default_model not in groups[slug]["models"]:
                 groups[slug]["models"].append(default_model)
+            # Also include a ``models`` list if present (avoids duplicating
+            # the full entry for every model on multi-model endpoints).
+            extra_models = entry.get("models")
+            if isinstance(extra_models, list):
+                for m in extra_models:
+                    m_str = str(m).strip()
+                    if m_str and m_str not in groups[slug]["models"]:
+                        groups[slug]["models"].append(m_str)
 
         for slug, grp in groups.items():
             if slug.lower() in seen_slugs:
@@ -1119,7 +1127,7 @@ def list_authenticated_providers(
             })
             seen_slugs.add(slug.lower())
 
-    # Sort: current provider first, then by model count descending
-    results.sort(key=lambda r: (not r["is_current"], -r["total_models"]))
+    # Sort: current provider first, then alphabetically by name
+    results.sort(key=lambda r: (not r["is_current"], r["name"].lower()))
 
     return results
