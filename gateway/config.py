@@ -283,7 +283,7 @@ class GatewayConfig:
             elif platform == Platform.WHATSAPP:
                 connected.append(platform)
             # Signal uses extra dict for config (http_url + account)
-            elif platform == Platform.SIGNAL and config.extra.get("http_url"):
+            elif platform == Platform.SIGNAL and config.extra.get("http_url") and config.extra.get("account"):
                 connected.append(platform)
             # Email uses extra dict for config (address + imap_host + smtp_host)
             elif platform == Platform.EMAIL and config.extra.get("address"):
@@ -701,6 +701,92 @@ def load_gateway_config() -> GatewayConfig:
                         frc = ",".join(str(v) for v in frc)
                     os.environ["WHATSAPP_FREE_RESPONSE_CHATS"] = str(frc)
 
+            # Signal settings → platform config + env vars used by the
+            # adapter and gateway authorization checks.
+            signal_cfg = yaml_cfg.get("signal", {})
+            if isinstance(signal_cfg, dict):
+                def _csv(value):
+                    if isinstance(value, list):
+                        return ",".join(str(v) for v in value)
+                    return str(value)
+
+                plat_data = platforms_data.setdefault(Platform.SIGNAL.value, {})
+                if not isinstance(plat_data, dict):
+                    plat_data = {}
+                    platforms_data[Platform.SIGNAL.value] = plat_data
+                extra = plat_data.setdefault("extra", {})
+                if not isinstance(extra, dict):
+                    extra = {}
+                    plat_data["extra"] = extra
+
+                if signal_cfg.get("enabled") is not None:
+                    plat_data["enabled"] = _coerce_bool(signal_cfg.get("enabled"), False)
+
+                for yaml_key, extra_key in (
+                    ("http_url", "http_url"),
+                    ("url", "http_url"),
+                    ("account", "account"),
+                    ("ignore_stories", "ignore_stories"),
+                    ("auto_start", "auto_start"),
+                    ("auto_start_daemon", "auto_start"),
+                    ("daemon_command", "daemon_command"),
+                    ("daemon_log_path", "daemon_log_path"),
+                    ("events_account_param", "events_account_param"),
+                    ("group_allowed_users", "group_allowed_users"),
+                    ("group_allow_from", "group_allowed_users"),
+                ):
+                    if yaml_key in signal_cfg:
+                        extra[extra_key] = signal_cfg[yaml_key]
+
+                if "http_url" in extra and not os.getenv("SIGNAL_HTTP_URL"):
+                    os.environ["SIGNAL_HTTP_URL"] = str(extra["http_url"])
+                if "account" in extra and not os.getenv("SIGNAL_ACCOUNT"):
+                    os.environ["SIGNAL_ACCOUNT"] = str(extra["account"])
+                if "allowed_users" in signal_cfg and not os.getenv("SIGNAL_ALLOWED_USERS"):
+                    os.environ["SIGNAL_ALLOWED_USERS"] = _csv(signal_cfg["allowed_users"])
+                if "allow_all_users" in signal_cfg and not os.getenv("SIGNAL_ALLOW_ALL_USERS"):
+                    os.environ["SIGNAL_ALLOW_ALL_USERS"] = str(signal_cfg["allow_all_users"]).lower()
+                if "group_allowed_users" in extra and not os.getenv("SIGNAL_GROUP_ALLOWED_USERS"):
+                    os.environ["SIGNAL_GROUP_ALLOWED_USERS"] = _csv(extra["group_allowed_users"])
+
+                signal_home = signal_cfg.get("home_channel")
+                if signal_home and "home_channel" not in plat_data:
+                    if isinstance(signal_home, dict):
+                        home_chat_id = signal_home.get("chat_id") or signal_home.get("id")
+                        home_name = signal_home.get("name", "Home")
+                    else:
+                        home_chat_id = signal_home
+                        home_name = signal_cfg.get("home_channel_name", "Home")
+                    if home_chat_id:
+                        plat_data["home_channel"] = {
+                            "platform": Platform.SIGNAL.value,
+                            "chat_id": str(home_chat_id),
+                            "name": str(home_name),
+                        }
+
+            # Also bridge values loaded through platforms.signal.extra so
+            # config.yaml-only deployments do not depend on duplicate .env
+            # entries for gateway auth or daemon lifecycle options.
+            signal_platform_data = platforms_data.get(Platform.SIGNAL.value, {})
+            if isinstance(signal_platform_data, dict):
+                signal_extra = signal_platform_data.get("extra", {})
+                if isinstance(signal_extra, dict):
+                    if signal_extra.get("http_url") and not os.getenv("SIGNAL_HTTP_URL"):
+                        os.environ["SIGNAL_HTTP_URL"] = str(signal_extra["http_url"])
+                    if signal_extra.get("account") and not os.getenv("SIGNAL_ACCOUNT"):
+                        os.environ["SIGNAL_ACCOUNT"] = str(signal_extra["account"])
+                    if signal_extra.get("group_allowed_users") and not os.getenv("SIGNAL_GROUP_ALLOWED_USERS"):
+                        group_users = signal_extra["group_allowed_users"]
+                        os.environ["SIGNAL_GROUP_ALLOWED_USERS"] = ",".join(str(v) for v in group_users) if isinstance(group_users, list) else str(group_users)
+                    if signal_extra.get("auto_start") is not None and not os.getenv("SIGNAL_AUTO_START"):
+                        os.environ["SIGNAL_AUTO_START"] = str(signal_extra["auto_start"]).lower()
+                    if signal_extra.get("daemon_command") and not os.getenv("SIGNAL_DAEMON_COMMAND"):
+                        os.environ["SIGNAL_DAEMON_COMMAND"] = str(signal_extra["daemon_command"])
+                    if signal_extra.get("daemon_log_path") and not os.getenv("SIGNAL_DAEMON_LOG"):
+                        os.environ["SIGNAL_DAEMON_LOG"] = str(signal_extra["daemon_log_path"])
+                    if signal_extra.get("events_account_param") is not None and not os.getenv("SIGNAL_EVENTS_ACCOUNT_PARAM"):
+                        os.environ["SIGNAL_EVENTS_ACCOUNT_PARAM"] = str(signal_extra["events_account_param"]).lower()
+
             # DingTalk settings → env vars (env vars take precedence)
             dingtalk_cfg = yaml_cfg.get("dingtalk", {})
             if isinstance(dingtalk_cfg, dict):
@@ -913,6 +999,16 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
             "account": signal_account,
             "ignore_stories": os.getenv("SIGNAL_IGNORE_STORIES", "true").lower() in ("true", "1", "yes"),
         })
+        if os.getenv("SIGNAL_GROUP_ALLOWED_USERS"):
+            config.platforms[Platform.SIGNAL].extra["group_allowed_users"] = os.getenv("SIGNAL_GROUP_ALLOWED_USERS")
+        if os.getenv("SIGNAL_AUTO_START"):
+            config.platforms[Platform.SIGNAL].extra["auto_start"] = os.getenv("SIGNAL_AUTO_START")
+        if os.getenv("SIGNAL_DAEMON_COMMAND"):
+            config.platforms[Platform.SIGNAL].extra["daemon_command"] = os.getenv("SIGNAL_DAEMON_COMMAND")
+        if os.getenv("SIGNAL_DAEMON_LOG"):
+            config.platforms[Platform.SIGNAL].extra["daemon_log_path"] = os.getenv("SIGNAL_DAEMON_LOG")
+        if os.getenv("SIGNAL_EVENTS_ACCOUNT_PARAM"):
+            config.platforms[Platform.SIGNAL].extra["events_account_param"] = os.getenv("SIGNAL_EVENTS_ACCOUNT_PARAM")
     signal_home = os.getenv("SIGNAL_HOME_CHANNEL")
     if signal_home and Platform.SIGNAL in config.platforms:
         config.platforms[Platform.SIGNAL].home_channel = HomeChannel(

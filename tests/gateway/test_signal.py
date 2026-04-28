@@ -59,13 +59,27 @@ class TestSignalConfigLoading:
 
     def test_signal_not_loaded_without_both_vars(self, monkeypatch):
         monkeypatch.setenv("SIGNAL_HTTP_URL", "http://localhost:9090")
-        # No SIGNAL_ACCOUNT
+        monkeypatch.delenv("SIGNAL_ACCOUNT", raising=False)
 
         from gateway.config import GatewayConfig, _apply_env_overrides
         config = GatewayConfig()
         _apply_env_overrides(config)
 
         assert Platform.SIGNAL not in config.platforms
+
+    def test_check_requirements_accepts_config_only(self, monkeypatch):
+        monkeypatch.delenv("SIGNAL_HTTP_URL", raising=False)
+        monkeypatch.delenv("SIGNAL_ACCOUNT", raising=False)
+
+        from gateway.platforms.signal import check_signal_requirements
+
+        config = PlatformConfig()
+        config.extra = {
+            "http_url": "http://localhost:8080",
+            "account": "+15551234567",
+        }
+
+        assert check_signal_requirements(config) is True
 
 # ---------------------------------------------------------------------------
 # Adapter Init & Helpers
@@ -89,6 +103,21 @@ class TestSignalAdapterInit:
     def test_self_message_filtering(self, monkeypatch):
         adapter = _make_signal_adapter(monkeypatch)
         assert adapter._account_normalized == "+15551234567"
+
+    def test_init_reads_group_allowlist_from_config(self, monkeypatch):
+        adapter = _make_signal_adapter(
+            monkeypatch,
+            group_allowed="",
+            group_allowed_users=["group-from-config"],
+        )
+        assert adapter.group_allow_from == {"group-from-config"}
+
+    def test_daemon_argv_uses_local_http_url(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch, auto_start=True)
+        argv = adapter._daemon_argv()
+        assert "--account" in argv
+        assert "+15551234567" in argv
+        assert argv[-2:] == ["--http", "localhost:8080"]
 
 
 class TestSignalHelpers:
@@ -242,6 +271,111 @@ class TestSignalAttachmentFetch:
 
 
 # ---------------------------------------------------------------------------
+# SSE / JSON-RPC event unwrapping
+# ---------------------------------------------------------------------------
+
+class TestSignalEventUnwrapping:
+    @pytest.mark.asyncio
+    async def test_handle_jsonrpc_receive_notification(self, monkeypatch):
+        """signal-cli SSE emits JSON-RPC receive notifications, not raw envelopes."""
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope({
+            "jsonrpc": "2.0",
+            "method": "receive",
+            "params": {
+                "account": "+15551234567",
+                "envelope": {
+                    "sourceNumber": "+15550000001",
+                    "sourceUuid": "uuid-sender",
+                    "sourceName": "Alice",
+                    "timestamp": 1712345678000,
+                    "dataMessage": {
+                        "message": "hello from signal",
+                        "timestamp": 1712345678000,
+                        "attachments": [],
+                    },
+                },
+            },
+        })
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "hello from signal"
+        assert event.source.user_id == "+15550000001"
+        assert event.source.user_id_alt == "uuid-sender"
+
+    @pytest.mark.asyncio
+    async def test_handle_manual_receive_result_notification(self, monkeypatch):
+        """Manual receive mode wraps the envelope under params.result."""
+        adapter = _make_signal_adapter(monkeypatch)
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope({
+            "jsonrpc": "2.0",
+            "method": "receive",
+            "params": {
+                "subscription": 0,
+                "result": {
+                    "account": "+15551234567",
+                    "envelope": {
+                        "sourceNumber": "+15550000002",
+                        "timestamp": 1712345678001,
+                        "dataMessage": {
+                            "message": "manual mode",
+                            "attachments": [],
+                        },
+                    },
+                },
+            },
+        })
+
+        adapter.handle_message.assert_awaited_once()
+        assert adapter.handle_message.await_args.args[0].text == "manual mode"
+
+    @pytest.mark.asyncio
+    async def test_ignores_events_for_other_accounts(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch, account="+15551234567")
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope({
+            "jsonrpc": "2.0",
+            "method": "receive",
+            "params": {
+                "account": "+19999999999",
+                "envelope": {
+                    "sourceNumber": "+15550000001",
+                    "timestamp": 1712345678000,
+                    "dataMessage": {"message": "wrong account"},
+                },
+            },
+        })
+
+        adapter.handle_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_group_event_sets_prefixed_and_raw_group_ids(self, monkeypatch):
+        adapter = _make_signal_adapter(monkeypatch, group_allowed="group-123")
+        adapter.handle_message = AsyncMock()
+
+        await adapter._handle_envelope({
+            "sourceNumber": "+15550000001",
+            "timestamp": 1712345678000,
+            "dataMessage": {
+                "message": "group hello",
+                "groupInfo": {"groupId": "group-123", "groupName": "Friends"},
+            },
+        })
+
+        adapter.handle_message.assert_awaited_once()
+        source = adapter.handle_message.await_args.args[0].source
+        assert source.chat_id == "group:group-123"
+        assert source.chat_id_alt == "group-123"
+        assert source.chat_type == "group"
+
+
+# ---------------------------------------------------------------------------
 # Session Source
 # ---------------------------------------------------------------------------
 
@@ -335,6 +469,43 @@ class TestSignalAuthorization:
         with patch.dict("os.environ", {}, clear=True):
             result = gw._is_user_authorized(source)
             assert result is False
+
+    def test_signal_uuid_allowlist_matches_user_id_alt(self):
+        from gateway.run import GatewayRunner
+        from gateway.config import GatewayConfig
+
+        gw = GatewayRunner.__new__(GatewayRunner)
+        gw.config = GatewayConfig()
+        gw.pairing_store = MagicMock()
+        gw.pairing_store.is_approved.return_value = False
+
+        source = MagicMock()
+        source.platform = Platform.SIGNAL
+        source.chat_type = "dm"
+        source.user_id = "+15559999999"
+        source.user_id_alt = "uuid-allowed"
+
+        with patch.dict("os.environ", {"SIGNAL_ALLOWED_USERS": "uuid-allowed"}, clear=True):
+            assert gw._is_user_authorized(source) is True
+
+    def test_signal_group_allowlist_authorizes_by_raw_group_id(self):
+        from gateway.run import GatewayRunner
+        from gateway.config import GatewayConfig
+
+        gw = GatewayRunner.__new__(GatewayRunner)
+        gw.config = GatewayConfig()
+        gw.pairing_store = MagicMock()
+        gw.pairing_store.is_approved.return_value = False
+
+        source = MagicMock()
+        source.platform = Platform.SIGNAL
+        source.chat_type = "group"
+        source.user_id = "+15559999999"
+        source.chat_id = "group:group-allowed"
+        source.chat_id_alt = "group-allowed"
+
+        with patch.dict("os.environ", {"SIGNAL_GROUP_ALLOWED_USERS": "group-allowed"}, clear=True):
+            assert gw._is_user_authorized(source) is True
 
 
 # ---------------------------------------------------------------------------

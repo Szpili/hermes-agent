@@ -12,6 +12,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
@@ -3224,7 +3225,8 @@ def _setup_signal():
 
     # Check if signal-cli is available
     print()
-    if shutil.which("signal-cli"):
+    signal_cli_found = shutil.which("signal-cli") is not None
+    if signal_cli_found:
         print_success("signal-cli found on PATH.")
     else:
         print_warning("signal-cli not found on PATH.")
@@ -3285,6 +3287,21 @@ def _setup_signal():
         return
 
     save_env_value("SIGNAL_ACCOUNT", account)
+
+    parsed_url = urlsplit(url)
+    is_local_http = (
+        parsed_url.scheme == "http"
+        and (parsed_url.hostname or "").lower() in ("127.0.0.1", "localhost", "::1")
+        and parsed_url.path in ("", "/")
+    )
+    if signal_cli_found and is_local_http:
+        print()
+        print_info("  Hermes can start the local signal-cli daemon with the gateway service.")
+        default_autostart = is_macos()
+        if prompt_yes_no("  Auto-start signal-cli with Hermes?", default_autostart):
+            save_env_value("SIGNAL_AUTO_START", "true")
+        else:
+            save_env_value("SIGNAL_AUTO_START", "false")
 
     # Allowed users
     print()

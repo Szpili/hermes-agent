@@ -19,7 +19,7 @@ The Signal adapter uses `httpx` (already a core Hermes dependency) for all commu
 ## Prerequisites
 
 - **signal-cli** — Java-based Signal client ([GitHub](https://github.com/AsamK/signal-cli))
-- **Java 17+** runtime — required by signal-cli
+- **Java runtime compatible with your signal-cli release** — recent signal-cli releases may require Java 25+
 - **A phone number** with Signal installed (for linking as a secondary device)
 
 ### Installing signal-cli
@@ -109,6 +109,7 @@ SIGNAL_ALLOWED_USERS=+1234567890,+0987654321    # Comma-separated E.164 numbers 
 # Optional
 SIGNAL_GROUP_ALLOWED_USERS=groupId1,groupId2     # Enable groups (omit to disable, * for all)
 SIGNAL_HOME_CHANNEL=+1234567890                  # Default delivery target for cron jobs
+SIGNAL_AUTO_START=true                           # Optional: Hermes starts local signal-cli daemon
 ```
 
 Then start the gateway:
@@ -118,6 +119,12 @@ hermes gateway              # Foreground
 hermes gateway install      # Install as a user service
 sudo hermes gateway install --system   # Linux only: boot-time system service
 ```
+
+On macOS, `hermes gateway install` creates a launchd user agent. If
+`SIGNAL_AUTO_START=true` and `SIGNAL_HTTP_URL` is a loopback HTTP URL such as
+`http://127.0.0.1:8080`, the gateway starts `signal-cli --account ... daemon
+--http ...` before connecting. The signal-cli log is written to
+`~/.hermes/logs/signal-cli.log` unless `SIGNAL_DAEMON_LOG` is set.
 
 ---
 
@@ -237,3 +244,7 @@ The adapter monitors the SSE connection and automatically reconnects if:
 | `SIGNAL_GROUP_ALLOWED_USERS` | No | — | Group IDs to monitor, or `*` for all (omit to disable groups) |
 | `SIGNAL_ALLOW_ALL_USERS` | No | `false` | Allow any user to interact (skip allowlist) |
 | `SIGNAL_HOME_CHANNEL` | No | — | Default delivery target for cron jobs |
+| `SIGNAL_AUTO_START` | No | `false` | Start local signal-cli daemon with Hermes gateway |
+| `SIGNAL_DAEMON_COMMAND` | No | `signal-cli` | Command/path used for daemon autostart |
+| `SIGNAL_DAEMON_LOG` | No | `~/.hermes/logs/signal-cli.log` | Log file for managed signal-cli daemon |
+| `SIGNAL_EVENTS_ACCOUNT_PARAM` | No | `true` | Include account query param on the SSE events request |

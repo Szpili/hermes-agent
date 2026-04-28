@@ -332,6 +332,24 @@ def _expand_whatsapp_auth_aliases(identifier: str) -> set:
 
     return resolved
 
+
+def _expand_signal_auth_aliases(identifier: str) -> set:
+    """Return Signal auth aliases for phone/UUID matching.
+
+    Signal events can expose either an E.164 phone number or a UUID depending
+    on contact/privacy state.  Allowlists accept both, and phone numbers should
+    match with or without the leading '+' to avoid fragile setup failures.
+    """
+    raw = str(identifier or "").strip()
+    if not raw:
+        return set()
+    aliases = {raw}
+    if raw.startswith("+") and raw[1:]:
+        aliases.add(raw[1:])
+    elif raw[0].isdigit():
+        aliases.add(f"+{raw}")
+    return aliases
+
 logger = logging.getLogger(__name__)
 
 # Sentinel placed into _running_agents immediately when a session starts
@@ -2539,7 +2557,7 @@ class GatewayRunner:
 
         elif platform == Platform.SIGNAL:
             from gateway.platforms.signal import SignalAdapter, check_signal_requirements
-            if not check_signal_requirements():
+            if not check_signal_requirements(config):
                 logger.warning("Signal: SIGNAL_HTTP_URL or SIGNAL_ACCOUNT not configured")
                 return None
             return SignalAdapter(config)
@@ -2691,6 +2709,7 @@ class GatewayRunner:
             Platform.QQBOT: "QQ_ALLOWED_USERS",
         }
         platform_group_env_map = {
+            Platform.SIGNAL: "SIGNAL_GROUP_ALLOWED_USERS",
             Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
         }
         platform_allow_all_map = {
@@ -2760,7 +2779,10 @@ class GatewayRunner:
             allowed_group_ids = {
                 chat_id.strip() for chat_id in group_allowlist.split(",") if chat_id.strip()
             }
-            if "*" in allowed_group_ids or source.chat_id in allowed_group_ids:
+            source_group_ids = {source.chat_id}
+            if getattr(source, "chat_id_alt", None):
+                source_group_ids.add(source.chat_id_alt)
+            if "*" in allowed_group_ids or bool(source_group_ids & allowed_group_ids):
                 return True
 
         # Check if user is in any allowlist
@@ -2779,6 +2801,9 @@ class GatewayRunner:
         if "@" in user_id:
             check_ids.add(user_id.split("@")[0])
 
+        if getattr(source, "user_id_alt", None):
+            check_ids.add(source.user_id_alt)
+
         # WhatsApp: resolve phone↔LID aliases from bridge session mapping files
         if source.platform == Platform.WHATSAPP:
             normalized_allowed_ids = set()
@@ -2791,6 +2816,19 @@ class GatewayRunner:
             normalized_user_id = _normalize_whatsapp_identifier(user_id)
             if normalized_user_id:
                 check_ids.add(normalized_user_id)
+
+        if source.platform == Platform.SIGNAL:
+            normalized_allowed_ids = set()
+            for allowed_id in allowed_ids:
+                normalized_allowed_ids.update(_expand_signal_auth_aliases(allowed_id))
+            if normalized_allowed_ids:
+                allowed_ids = normalized_allowed_ids
+
+            normalized_check_ids = set()
+            for check_id in check_ids:
+                normalized_check_ids.update(_expand_signal_auth_aliases(check_id))
+            if normalized_check_ids:
+                check_ids = normalized_check_ids
 
         return bool(check_ids & allowed_ids)
 

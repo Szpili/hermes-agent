@@ -17,11 +17,14 @@ import json
 import logging
 import os
 import random
+import shlex
+import shutil
+import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Any
-from urllib.parse import quote, unquote
+from urllib.parse import unquote, urlsplit
 
 import httpx
 
@@ -35,8 +38,10 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_document_from_bytes,
     cache_image_from_url,
+    is_network_accessible,
 )
 from gateway.platforms.helpers import redact_phone
+from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +64,31 @@ HEALTH_CHECK_STALE_THRESHOLD = 120.0  # seconds without SSE activity before conc
 def _parse_comma_list(value: str) -> List[str]:
     """Split a comma-separated string into a list, stripping whitespace."""
     return [v.strip() for v in value.split(",") if v.strip()]
+
+
+def _coerce_bool(value: Any, default: bool = False) -> bool:
+    """Coerce env/config bool-ish values."""
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("true", "1", "yes", "on"):
+            return True
+        if lowered in ("false", "0", "no", "off"):
+            return False
+        return default
+    return bool(value)
+
+
+def _coerce_csv(value: Any) -> str:
+    """Render a config list/string as the comma-separated env format."""
+    if value is None:
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        return ",".join(str(v).strip() for v in value if str(v).strip())
+    return str(value).strip()
 
 
 def _guess_extension(data: bytes) -> str:
@@ -127,9 +157,36 @@ def _render_mentions(text: str, mentions: list) -> str:
     return text
 
 
-def check_signal_requirements() -> bool:
-    """Check if Signal is configured (has URL and account)."""
-    return bool(os.getenv("SIGNAL_HTTP_URL") and os.getenv("SIGNAL_ACCOUNT"))
+def check_signal_requirements(config: PlatformConfig | None = None) -> bool:
+    """Check if Signal is configured (has URL and account).
+
+    Historically this only inspected environment variables.  Keep that path,
+    but also accept a PlatformConfig so config.yaml-only installs work.
+    """
+    extra = config.extra if config and isinstance(config.extra, dict) else {}
+    return bool(
+        (extra.get("http_url") or os.getenv("SIGNAL_HTTP_URL"))
+        and (extra.get("account") or os.getenv("SIGNAL_ACCOUNT"))
+    )
+
+
+def _http_bind_from_url(http_url: str) -> tuple[str, int] | None:
+    """Return the host/port pair signal-cli should bind for a daemon URL."""
+    parsed = urlsplit(http_url)
+    if parsed.scheme != "http" or parsed.path not in ("", "/"):
+        return None
+    host = parsed.hostname or "127.0.0.1"
+    port = parsed.port or 8080
+    return host, port
+
+
+def _is_safe_autostart_url(http_url: str) -> bool:
+    """Only autostart a daemon on loopback HTTP endpoints."""
+    bind = _http_bind_from_url(http_url)
+    if not bind:
+        return False
+    host, _port = bind
+    return not is_network_accessible(host)
 
 
 # ---------------------------------------------------------------------------
@@ -147,10 +204,37 @@ class SignalAdapter(BasePlatformAdapter):
         extra = config.extra or {}
         self.http_url = extra.get("http_url", "http://127.0.0.1:8080").rstrip("/")
         self.account = extra.get("account", "")
-        self.ignore_stories = extra.get("ignore_stories", True)
+        self.ignore_stories = _coerce_bool(extra.get("ignore_stories"), True)
+        self.events_account_param = _coerce_bool(
+            extra.get("events_account_param", os.getenv("SIGNAL_EVENTS_ACCOUNT_PARAM")),
+            True,
+        )
+
+        # Optional lifecycle ownership.  This makes macOS launchd deployments
+        # practical: Hermes can bring up a local signal-cli HTTP daemon before
+        # connecting, while refusing to bind non-loopback endpoints.
+        self.auto_start_daemon = _coerce_bool(
+            extra.get("auto_start") or extra.get("auto_start_daemon") or os.getenv("SIGNAL_AUTO_START"),
+            False,
+        )
+        self.daemon_command = (
+            extra.get("daemon_command")
+            or os.getenv("SIGNAL_DAEMON_COMMAND")
+            or "signal-cli"
+        )
+        self.daemon_log_path = Path(
+            extra.get("daemon_log_path")
+            or os.getenv("SIGNAL_DAEMON_LOG")
+            or (get_hermes_home() / "logs" / "signal-cli.log")
+        ).expanduser()
+        self._daemon_process: Optional[subprocess.Popen] = None
+        self._daemon_log_handle = None
 
         # Parse allowlists — group policy is derived from presence of group allowlist
-        group_allowed_str = os.getenv("SIGNAL_GROUP_ALLOWED_USERS", "")
+        group_allowed_str = (
+            _coerce_csv(extra.get("group_allowed_users") or extra.get("group_allow_from"))
+            or os.getenv("SIGNAL_GROUP_ALLOWED_USERS", "")
+        )
         self.group_allow_from = set(_parse_comma_list(group_allowed_str))
 
         # HTTP client
@@ -172,9 +256,10 @@ class SignalAdapter(BasePlatformAdapter):
         self._recent_sent_timestamps: set = set()
         self._max_recent_timestamps = 50
 
-        logger.info("Signal adapter initialized: url=%s account=%s groups=%s",
+        logger.info("Signal adapter initialized: url=%s account=%s groups=%s autostart=%s",
                      self.http_url, redact_phone(self.account),
-                     "enabled" if self.group_allow_from else "disabled")
+                     "enabled" if self.group_allow_from else "disabled",
+                     self.auto_start_daemon)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -193,16 +278,15 @@ class SignalAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("Signal: Could not acquire phone lock (non-fatal): %s", e)
 
-        self.client = httpx.AsyncClient(timeout=30.0)
+        # signal-cli is normally local.  Do not let global proxy env vars route
+        # localhost through a system proxy under launchd/Homebrew environments.
+        self.client = httpx.AsyncClient(timeout=30.0, trust_env=False)
+
+        if self.auto_start_daemon:
+            await self._ensure_daemon_started()
 
         # Health check — verify signal-cli daemon is reachable
-        try:
-            resp = await self.client.get(f"{self.http_url}/api/v1/check", timeout=10.0)
-            if resp.status_code != 200:
-                logger.error("Signal: health check failed (status %d)", resp.status_code)
-                return False
-        except Exception as e:
-            logger.error("Signal: cannot reach signal-cli at %s: %s", self.http_url, e)
+        if not await self._check_daemon_health(timeout=10.0, log_errors=True):
             return False
 
         self._running = True
@@ -240,9 +324,120 @@ class SignalAdapter(BasePlatformAdapter):
             await self.client.aclose()
             self.client = None
 
+        if self._daemon_process and self._daemon_process.poll() is None:
+            self._daemon_process.terminate()
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(self._daemon_process.wait),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                self._daemon_process.kill()
+                await asyncio.to_thread(self._daemon_process.wait)
+        self._daemon_process = None
+
+        if self._daemon_log_handle:
+            try:
+                self._daemon_log_handle.close()
+            except Exception:
+                pass
+            self._daemon_log_handle = None
+
         self._release_platform_lock()
 
         logger.info("Signal: disconnected")
+
+    async def _check_daemon_health(
+        self,
+        *,
+        timeout: float = 5.0,
+        log_errors: bool = False,
+    ) -> bool:
+        """Return True when the signal-cli HTTP daemon is reachable."""
+        if not self.client:
+            return False
+        try:
+            resp = await self.client.get(f"{self.http_url}/api/v1/check", timeout=timeout)
+            if resp.status_code == 200:
+                return True
+            if log_errors:
+                logger.error("Signal: health check failed (status %d)", resp.status_code)
+        except Exception as e:
+            if log_errors:
+                logger.error("Signal: cannot reach signal-cli at %s: %s", self.http_url, e)
+        return False
+
+    def _daemon_argv(self) -> list[str] | None:
+        """Build argv for the managed signal-cli daemon process."""
+        bind = _http_bind_from_url(self.http_url)
+        if not bind:
+            return None
+        host, port = bind
+        command = shlex.split(str(self.daemon_command))
+        if not command:
+            return None
+        if len(command) == 1:
+            resolved = shutil.which(command[0])
+            if resolved:
+                command[0] = resolved
+        return command + [
+            "--account",
+            self.account,
+            "daemon",
+            "--http",
+            f"{host}:{port}",
+        ]
+
+    async def _ensure_daemon_started(self) -> bool:
+        """Start signal-cli locally when configured to own its lifecycle."""
+        if await self._check_daemon_health(timeout=2.0):
+            return True
+
+        if not _is_safe_autostart_url(self.http_url):
+            logger.error(
+                "Signal: refusing to autostart signal-cli for non-loopback or unsupported URL %s",
+                self.http_url,
+            )
+            return False
+
+        argv = self._daemon_argv()
+        if not argv:
+            logger.error("Signal: could not build signal-cli daemon command")
+            return False
+
+        if len(argv) > 0 and not Path(argv[0]).exists() and not shutil.which(argv[0]):
+            logger.error("Signal: %s not found on PATH", argv[0])
+            return False
+
+        self.daemon_log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._daemon_log_handle = open(self.daemon_log_path, "ab")
+        logger.info("Signal: starting signal-cli daemon on %s (log: %s)", self.http_url, self.daemon_log_path)
+        try:
+            self._daemon_process = subprocess.Popen(
+                argv,
+                stdout=self._daemon_log_handle,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                close_fds=True,
+            )
+        except Exception as e:
+            logger.error("Signal: failed to start signal-cli daemon: %s", e)
+            return False
+
+        for _ in range(40):
+            if self._daemon_process.poll() is not None:
+                logger.error(
+                    "Signal: signal-cli daemon exited with code %s; see %s",
+                    self._daemon_process.returncode,
+                    self.daemon_log_path,
+                )
+                return False
+            if await self._check_daemon_health(timeout=1.0):
+                return True
+            await asyncio.sleep(0.25)
+
+        logger.error("Signal: signal-cli daemon did not become healthy within 10s")
+        return False
 
     # ------------------------------------------------------------------
     # SSE Streaming (inbound messages)
@@ -250,7 +445,8 @@ class SignalAdapter(BasePlatformAdapter):
 
     async def _sse_listener(self) -> None:
         """Listen for SSE events from signal-cli daemon."""
-        url = f"{self.http_url}/api/v1/events?account={quote(self.account, safe='')}"
+        url = f"{self.http_url}/api/v1/events"
+        stream_params = {"account": self.account} if self.events_account_param else None
         backoff = SSE_RETRY_DELAY_INITIAL
 
         while self._running:
@@ -258,9 +454,11 @@ class SignalAdapter(BasePlatformAdapter):
                 logger.debug("Signal SSE: connecting to %s", url)
                 async with self.client.stream(
                     "GET", url,
+                    params=stream_params,
                     headers={"Accept": "text/event-stream"},
                     timeout=None,
                 ) as response:
+                    response.raise_for_status()
                     self._sse_response = response
                     backoff = SSE_RETRY_DELAY_INITIAL  # Reset on successful connection
                     self._last_sse_activity = time.time()
@@ -358,8 +556,39 @@ class SignalAdapter(BasePlatformAdapter):
     # Message Handling
     # ------------------------------------------------------------------
 
+    def _extract_envelope_from_event(self, event: dict) -> tuple[Optional[dict], Optional[str]]:
+        """Unwrap signal-cli JSON-RPC receive notifications into envelopes.
+
+        The HTTP SSE endpoint emits JSON-RPC notifications in the form
+        ``{"method":"receive","params":{"envelope":...}}``.  Manual receive
+        mode can wrap the same envelope under ``params.result.envelope``.  Some
+        older tests and shims pass a raw envelope directly, so keep accepting
+        that shape too.
+        """
+        if not isinstance(event, dict):
+            return None, None
+
+        if event.get("method") == "receive" and isinstance(event.get("params"), dict):
+            params = event["params"]
+            result = params.get("result") if isinstance(params.get("result"), dict) else {}
+            envelope = params.get("envelope") or result.get("envelope")
+            account = params.get("account") or result.get("account")
+            return envelope if isinstance(envelope, dict) else None, account
+
+        if isinstance(event.get("envelope"), dict):
+            return event["envelope"], event.get("account")
+
+        return event, event.get("account")
+
     async def _handle_envelope(self, envelope: dict) -> None:
         """Process an incoming signal-cli envelope."""
+        envelope, event_account = self._extract_envelope_from_event(envelope)
+        if not envelope:
+            return
+        if event_account and self.account and event_account != self.account:
+            logger.debug("Signal: ignoring event for account %s", redact_phone(str(event_account)))
+            return
+
         # Unwrap nested envelope if present
         envelope_data = envelope.get("envelope", envelope)
 
