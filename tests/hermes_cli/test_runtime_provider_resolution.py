@@ -1,4 +1,14 @@
+import base64
+import json
+import time
+
 from hermes_cli import runtime_provider as rp
+
+
+def _jwt_with_exp(exp_epoch):
+    payload = {"exp": exp_epoch}
+    encoded = base64.urlsafe_b64encode(json.dumps(payload).encode()).rstrip(b"=").decode()
+    return f"h.{encoded}.s"
 
 
 def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
@@ -23,6 +33,39 @@ def test_resolve_runtime_provider_uses_credential_pool(monkeypatch):
     assert resolved["api_key"] == "pool-token"
     assert resolved["credential_pool"] is not None
     assert resolved["source"] == "manual"
+
+
+def test_resolve_runtime_provider_refreshes_expired_codex_pool_entry(monkeypatch):
+    class _Entry:
+        access_token = _jwt_with_exp(int(time.time()) - 10)
+        source = "device_code"
+        base_url = "https://chatgpt.com/backend-api/codex"
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return _Entry()
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openai-codex")
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.setattr(
+        rp,
+        "resolve_codex_runtime_credentials",
+        lambda: {
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "refreshed-codex-token",
+            "source": "hermes-auth-store",
+            "last_refresh": "2026-04-12T00:00:00Z",
+        },
+    )
+
+    resolved = rp.resolve_runtime_provider(requested="openai-codex")
+
+    assert resolved["api_key"] == "refreshed-codex-token"
+    assert resolved.get("credential_pool") is None
 
 
 def test_resolve_runtime_provider_anthropic_pool_respects_config_base_url(monkeypatch):

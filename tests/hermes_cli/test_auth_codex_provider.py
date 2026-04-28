@@ -16,6 +16,8 @@ from hermes_cli.auth import (
     _save_codex_tokens,
     _write_codex_cli_tokens,
     _import_codex_cli_tokens,
+    _login_openai_codex,
+    _resolve_codex_base_url,
     get_codex_auth_status,
     get_provider_auth_state,
     resolve_codex_runtime_credentials,
@@ -156,6 +158,22 @@ def test_import_codex_cli_tokens(tmp_path, monkeypatch):
     assert tokens["refresh_token"] == "cli-rt"
 
 
+def test_import_codex_cli_tokens_allows_expired_access_for_runtime(tmp_path, monkeypatch):
+    codex_home = tmp_path / "codex-cli"
+    codex_home.mkdir(parents=True, exist_ok=True)
+    expired_token = _jwt_with_exp(int(time.time()) - 10)
+    (codex_home / "auth.json").write_text(json.dumps({
+        "tokens": {"access_token": expired_token, "refresh_token": "cli-rt"},
+    }))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    assert _import_codex_cli_tokens() is None
+    tokens = _import_codex_cli_tokens(allow_expired_access_token=True)
+    assert tokens is not None
+    assert tokens["access_token"] == expired_token
+    assert tokens["refresh_token"] == "cli-rt"
+
+
 def test_import_codex_cli_tokens_missing(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "nonexistent"))
     assert _import_codex_cli_tokens() is None
@@ -274,10 +292,94 @@ def test_refresh_codex_auth_tokens_writes_back_to_cli(tmp_path, monkeypatch):
     assert cli_data["tokens"]["refresh_token"] == "refreshed-rt"
 
 
+def test_resolve_imports_expired_codex_cli_token_and_refreshes(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    codex_home = tmp_path / "codex-cli"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+
+    expired_token = _jwt_with_exp(int(time.time()) - 10)
+    (codex_home / "auth.json").write_text(json.dumps({
+        "tokens": {"access_token": expired_token, "refresh_token": "cli-refresh-old"},
+    }))
+
+    monkeypatch.setattr("hermes_cli.auth.refresh_codex_oauth_pure", lambda *a, **kw: {
+        "access_token": "access-refreshed",
+        "refresh_token": "refresh-refreshed",
+        "last_refresh": "2026-04-12T01:00:00Z",
+    })
+
+    creds = resolve_codex_runtime_credentials()
+
+    assert creds["api_key"] == "access-refreshed"
+    stored = _read_codex_tokens()
+    assert stored["tokens"]["access_token"] == "access-refreshed"
+    cli_data = json.loads((codex_home / "auth.json").read_text())
+    assert cli_data["tokens"]["access_token"] == "access-refreshed"
+    assert cli_data["tokens"]["refresh_token"] == "refresh-refreshed"
+
+
+def test_login_openai_codex_reuses_codex_cli_login(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    codex_home = tmp_path / "codex-cli"
+    hermes_home.mkdir(parents=True, exist_ok=True)
+    codex_home.mkdir(parents=True, exist_ok=True)
+    (hermes_home / "auth.json").write_text(json.dumps({"version": 1, "providers": {}}))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.delenv("HERMES_CODEX_BASE_URL", raising=False)
+    monkeypatch.delenv("CODEX_BRIDGE_URL", raising=False)
+
+    future_token = _jwt_with_exp(int(time.time()) + 3600)
+    (codex_home / "auth.json").write_text(json.dumps({
+        "tokens": {"access_token": future_token, "refresh_token": "cli-refresh"},
+    }))
+
+    updated = {}
+
+    def _fake_update(provider, base_url):
+        updated["value"] = (provider, base_url)
+        return tmp_path / "config.yaml"
+
+    monkeypatch.setattr(
+        "hermes_cli.auth._update_config_for_provider",
+        _fake_update,
+    )
+    monkeypatch.setattr("hermes_cli.auth._codex_device_code_login", lambda: (_ for _ in ()).throw(AssertionError("device flow should not run")))
+
+    _login_openai_codex(object(), PROVIDER_REGISTRY["openai-codex"])
+
+    assert updated["value"] == ("openai-codex", DEFAULT_CODEX_BASE_URL)
+    stored = _read_codex_tokens()
+    assert stored["tokens"]["access_token"] == future_token
+
+
+def test_resolve_codex_base_url_supports_legacy_bridge_env(monkeypatch):
+    monkeypatch.delenv("HERMES_CODEX_BASE_URL", raising=False)
+    monkeypatch.setenv("CODEX_BRIDGE_URL", "http://127.0.0.1:19092/")
+    assert _resolve_codex_base_url() == "http://127.0.0.1:19092"
+
+    monkeypatch.setenv("HERMES_CODEX_BASE_URL", "https://codex.example.test/")
+    assert _resolve_codex_base_url() == "https://codex.example.test"
+
+
+def test_codex_provider_overlay_defaults_to_production_backend():
+    from hermes_cli.providers import HERMES_OVERLAYS
+
+    overlay = HERMES_OVERLAYS["openai-codex"]
+    assert overlay.base_url_override == DEFAULT_CODEX_BASE_URL
+    assert overlay.base_url_env_var == "HERMES_CODEX_BASE_URL"
+
+
 def test_resolve_returns_hermes_auth_store_source(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes"
     _setup_hermes_auth(hermes_home)
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("HERMES_CODEX_BASE_URL", raising=False)
+    monkeypatch.delenv("CODEX_BRIDGE_URL", raising=False)
 
     creds = resolve_codex_runtime_credentials()
     assert creds["source"] == "hermes-auth-store"

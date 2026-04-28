@@ -23,6 +23,7 @@ from hermes_cli.auth import (
     _codex_access_token_is_expiring,
     _decode_jwt_claims,
     _import_codex_cli_tokens,
+    _resolve_codex_base_url,
     _write_codex_cli_tokens,
     _load_auth_store,
     _load_provider_state,
@@ -468,7 +469,7 @@ class CredentialPool:
         if self.provider != "openai-codex":
             return entry
         try:
-            cli_tokens = _import_codex_cli_tokens()
+            cli_tokens = _import_codex_cli_tokens(allow_expired_access_token=True)
             if not cli_tokens:
                 return entry
             cli_refresh = cli_tokens.get("refresh_token", "")
@@ -1238,7 +1239,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         if not (isinstance(tokens, dict) and tokens.get("access_token")):
             try:
                 from hermes_cli.auth import _import_codex_cli_tokens, _save_codex_tokens
-                cli_tokens = _import_codex_cli_tokens()
+                cli_tokens = _import_codex_cli_tokens(allow_expired_access_token=True)
                 if cli_tokens:
                     logger.info("Importing Codex CLI tokens into Hermes auth store.")
                     _save_codex_tokens(cli_tokens)
@@ -1259,7 +1260,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                     "auth_type": AUTH_TYPE_OAUTH,
                     "access_token": tokens.get("access_token", ""),
                     "refresh_token": tokens.get("refresh_token"),
-                    "base_url": "https://chatgpt.com/backend-api/codex",
+                    "base_url": _resolve_codex_base_url(),
                     "last_refresh": state.get("last_refresh"),
                     "label": label_from_token(tokens.get("access_token", ""), "device_code"),
                 },

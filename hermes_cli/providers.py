@@ -57,6 +57,7 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         transport="codex_responses",
         auth_type="oauth_external",
         base_url_override="https://chatgpt.com/backend-api/codex",
+        base_url_env_var="HERMES_CODEX_BASE_URL",
     ),
     "qwen-oauth": HermesOverlay(
         transport="openai_chat",

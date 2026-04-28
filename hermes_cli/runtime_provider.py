@@ -13,10 +13,12 @@ from hermes_cli import auth as auth_mod
 from agent.credential_pool import CredentialPool, PooledCredential, get_custom_provider_pool_key, load_pool
 from hermes_cli.auth import (
     AuthError,
+    CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
     DEFAULT_CODEX_BASE_URL,
     DEFAULT_QWEN_BASE_URL,
     PROVIDER_REGISTRY,
     _agent_key_is_usable,
+    _codex_access_token_is_expiring,
     format_auth_error,
     resolve_provider,
     resolve_nous_runtime_credentials,
@@ -750,6 +752,10 @@ def resolve_runtime_provider(
             }
             if not _agent_key_is_usable(nous_state, min_ttl):
                 logger.debug("Nous pool entry agent_key expired/missing, falling through to runtime resolution")
+                pool_api_key = ""
+        if provider == "openai-codex" and entry is not None and pool_api_key:
+            if _codex_access_token_is_expiring(pool_api_key, CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS):
+                logger.debug("Codex pool entry access token expired/expiring, falling through to runtime refresh")
                 pool_api_key = ""
         if entry is not None and pool_api_key:
             return _resolve_runtime_from_pool_entry(

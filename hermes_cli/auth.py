@@ -1378,12 +1378,40 @@ def _is_remote_session() -> bool:
 
 
 # =============================================================================
-# OpenAI Codex auth — tokens stored in ~/.hermes/auth.json (not ~/.codex/)
+# OpenAI Codex auth.
 #
-# Hermes maintains its own Codex OAuth session separate from the Codex CLI
-# and VS Code extension. This prevents refresh token rotation conflicts
-# where one app's refresh invalidates the other's session.
+# Hermes stores its runtime copy in ~/.hermes/auth.json, but can bootstrap from
+# the Codex CLI's ~/.codex/auth.json. Refresh tokens rotate on every refresh, so
+# when Hermes refreshes a CLI-derived session it writes the new pair back to the
+# CLI file to keep both tools usable.
 # =============================================================================
+
+def _codex_cli_auth_path() -> Path:
+    codex_home = os.getenv("CODEX_HOME", "").strip()
+    if not codex_home:
+        codex_home = str(Path.home() / ".codex")
+    return Path(codex_home).expanduser() / "auth.json"
+
+
+def _read_codex_cli_auth_payload() -> Optional[Dict[str, Any]]:
+    auth_path = _codex_cli_auth_path()
+    if not auth_path.is_file():
+        return None
+    try:
+        payload = json.loads(auth_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.debug("Failed to read Codex CLI auth file %s: %s", auth_path, exc)
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _resolve_codex_base_url() -> str:
+    """Return Codex backend URL, defaulting to the production ChatGPT Codex API."""
+    for env_var in ("HERMES_CODEX_BASE_URL", "CODEX_BRIDGE_URL"):
+        value = os.getenv(env_var, "").strip().rstrip("/")
+        if value:
+            return value
+    return DEFAULT_CODEX_BASE_URL
 
 def _read_codex_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     """Read Codex OAuth tokens from Hermes auth store (~/.hermes/auth.json).
@@ -1450,10 +1478,7 @@ def _write_codex_cli_tokens(
     This mirrors the Anthropic write-back to ~/.claude/.credentials.json
     via ``_write_claude_code_credentials()``.
     """
-    codex_home = os.getenv("CODEX_HOME", "").strip()
-    if not codex_home:
-        codex_home = str(Path.home() / ".codex")
-    auth_path = Path(codex_home).expanduser() / "auth.json"
+    auth_path = _codex_cli_auth_path()
     try:
         existing: Dict[str, Any] = {}
         if auth_path.is_file():
@@ -1608,36 +1633,40 @@ def _refresh_codex_auth_tokens(
     return updated_tokens
 
 
-def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
+def _import_codex_cli_tokens(
+    *,
+    allow_expired_access_token: bool = False,
+) -> Optional[Dict[str, str]]:
     """Try to read tokens from ~/.codex/auth.json (Codex CLI shared file).
     
-    Returns tokens dict if valid and not expired, None otherwise.
-    Does NOT write to the shared file.
+    Returns a tokens dict when access_token and refresh_token are present.
+    By default expired access tokens are rejected. Runtime callers may set
+    ``allow_expired_access_token=True`` because the refresh token can still
+    produce a fresh access token.
     """
-    codex_home = os.getenv("CODEX_HOME", "").strip()
-    if not codex_home:
-        codex_home = str(Path.home() / ".codex")
-    auth_path = Path(codex_home).expanduser() / "auth.json"
-    if not auth_path.is_file():
+    auth_path = _codex_cli_auth_path()
+    payload = _read_codex_cli_auth_payload()
+    if payload is None:
         return None
     try:
-        payload = json.loads(auth_path.read_text())
         tokens = payload.get("tokens")
         if not isinstance(tokens, dict):
             return None
         access_token = tokens.get("access_token")
         refresh_token = tokens.get("refresh_token")
-        if not access_token or not refresh_token:
+        if not isinstance(access_token, str) or not access_token.strip():
             return None
-        # Reject expired tokens — importing stale tokens from ~/.codex/
-        # that can't be refreshed leaves the user stuck with "Login successful!"
-        # but no working credentials.
-        if _codex_access_token_is_expiring(access_token, 0):
+        if not isinstance(refresh_token, str) or not refresh_token.strip():
+            return None
+        if (not allow_expired_access_token) and _codex_access_token_is_expiring(access_token, 0):
             logger.debug(
                 "Codex CLI tokens at %s are expired — skipping import.", auth_path,
             )
             return None
-        return dict(tokens)
+        imported = dict(tokens)
+        imported["access_token"] = access_token.strip()
+        imported["refresh_token"] = refresh_token.strip()
+        return imported
     except Exception:
         return None
 
@@ -1657,13 +1686,15 @@ def resolve_codex_runtime_credentials(
         if orig_err.code != "codex_auth_missing":
             raise
 
-        # Migration: user had Codex as active provider with old storage (~/.codex/).
-        cli_tokens = _import_codex_cli_tokens()
+        # Migration/bootstrap: user has Codex CLI installed and logged in.
+        # Accept an expired access token here; the refresh token can still
+        # recover it and _refresh_codex_auth_tokens() writes the rotated pair
+        # back to ~/.codex/auth.json.
+        cli_tokens = _import_codex_cli_tokens(allow_expired_access_token=True)
         if cli_tokens:
-            logger.info("Migrating Codex credentials from ~/.codex/ to Hermes auth store")
-            print("⚠️  Migrating Codex credentials to Hermes's own auth store.")
-            print("   This avoids conflicts with Codex CLI and VS Code.")
-            print("   Run `hermes auth` to create a fully independent session.\n")
+            logger.info("Importing Codex CLI credentials into Hermes auth store")
+            print("Using existing Codex CLI login from ~/.codex/auth.json.")
+            print("Hermes will keep refreshed Codex tokens synced back to Codex CLI.\n")
             _save_codex_tokens(cli_tokens)
             data = _read_codex_tokens()
         else:
@@ -1690,10 +1721,7 @@ def resolve_codex_runtime_credentials(
                 tokens = _refresh_codex_auth_tokens(tokens, refresh_timeout_seconds)
                 access_token = str(tokens.get("access_token", "") or "").strip()
 
-    base_url = (
-        os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
-        or DEFAULT_CODEX_BASE_URL
-    )
+    base_url = _resolve_codex_base_url()
 
     return {
         "provider": "openai-codex",
@@ -3020,8 +3048,11 @@ def login_command(args) -> None:
 def _login_openai_codex(args, pconfig: ProviderConfig) -> None:
     """OpenAI Codex login via device code flow. Tokens stored in ~/.hermes/auth.json."""
 
-    # Check for existing Hermes-owned credentials
+    # Check for existing Hermes-owned credentials without bootstrapping from the
+    # Codex CLI yet; CLI credentials are handled by the automatic import path
+    # below and should not trigger the reuse prompt.
     try:
+        _read_codex_tokens()
         existing = resolve_codex_runtime_credentials()
         # Verify the resolved token is actually usable (not expired).
         # resolve_codex_runtime_credentials attempts refresh, so if we get
@@ -3045,24 +3076,19 @@ def _login_openai_codex(args, pconfig: ProviderConfig) -> None:
     except AuthError:
         pass
 
-    # Check for existing Codex CLI tokens we can import
-    cli_tokens = _import_codex_cli_tokens()
+    # Check for existing Codex CLI tokens we can import. This is the common
+    # macOS setup path when the user already installed and ran `codex login`.
+    cli_tokens = _import_codex_cli_tokens(allow_expired_access_token=True)
     if cli_tokens:
         print("Found existing Codex CLI credentials at ~/.codex/auth.json")
-        print("Hermes will create its own session to avoid conflicts with Codex CLI / VS Code.")
-        try:
-            do_import = input("Import these credentials? (a separate login is recommended) [y/N]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            do_import = "n"
-        if do_import in ("y", "yes"):
-            _save_codex_tokens(cli_tokens)
-            base_url = os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/") or DEFAULT_CODEX_BASE_URL
-            config_path = _update_config_for_provider("openai-codex", base_url)
-            print()
-            print("Credentials imported. Note: if Codex CLI refreshes its token,")
-            print("Hermes will keep working independently with its own session.")
-            print(f"  Config updated: {config_path} (model.provider=openai-codex)")
-            return
+        print("Importing them for Hermes and keeping refreshes synced back to Codex CLI.")
+        _save_codex_tokens(cli_tokens)
+        existing = resolve_codex_runtime_credentials()
+        config_path = _update_config_for_provider("openai-codex", existing.get("base_url", DEFAULT_CODEX_BASE_URL))
+        print()
+        print("Login successful!")
+        print(f"  Config updated: {config_path} (model.provider=openai-codex)")
+        return
 
     # Run a fresh device code flow — Hermes gets its own OAuth session
     print()
@@ -3210,10 +3236,7 @@ def _codex_device_code_login() -> Dict[str, Any]:
         )
 
     # Return tokens for the caller to persist (no longer writes to ~/.codex/)
-    base_url = (
-        os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
-        or DEFAULT_CODEX_BASE_URL
-    )
+    base_url = _resolve_codex_base_url()
 
     return {
         "tokens": {
