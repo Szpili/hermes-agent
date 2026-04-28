@@ -96,6 +96,31 @@ class TestVerboseAndToolProgress:
         assert cli.tool_progress_mode in ("off", "new", "all", "verbose")
 
 
+class TestModelNormalizationOutput:
+    def test_provider_prefix_normalization_is_quiet(self):
+        import cli as cli_mod
+
+        assert cli_mod._is_quiet_provider_prefix_normalization(
+            "openai-codex/gpt-5.5",
+            "gpt-5.5",
+            "openai-codex",
+        )
+        assert cli_mod._is_quiet_provider_prefix_normalization(
+            "openai/gpt-5.5",
+            "gpt-5.5",
+            "openai-codex",
+        )
+
+    def test_real_model_rewrite_still_warns(self):
+        import cli as cli_mod
+
+        assert not cli_mod._is_quiet_provider_prefix_normalization(
+            "claude-opus-4.6",
+            "claude-opus-4-6",
+            "anthropic",
+        )
+
+
 class TestBusyInputMode:
     def test_default_busy_input_mode_is_interrupt(self):
         cli = _make_cli()

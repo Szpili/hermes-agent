@@ -1113,6 +1113,26 @@ def _rich_text_from_ansi(text: str) -> _RichText:
     return _RichText.from_ansi(text or "")
 
 
+def _is_quiet_provider_prefix_normalization(
+    original_model: str,
+    normalized_model: str,
+    provider: str,
+) -> bool:
+    """Return True for harmless vendor-prefix stripping that should not warn."""
+    original = (original_model or "").strip()
+    normalized = (normalized_model or "").strip()
+    provider = (provider or "").strip().lower()
+    if not original or not normalized or "/" not in original:
+        return False
+    prefix, bare = original.split("/", 1)
+    prefix = prefix.strip().lower()
+    if bare != normalized:
+        return False
+    if prefix == provider:
+        return True
+    return provider == "openai-codex" and prefix == "openai"
+
+
 def _cprint(text: str):
     """Print ANSI-colored text through prompt_toolkit's native renderer.
 
@@ -2234,9 +2254,14 @@ class HermesCLI:
             if resolved_provider not in _AGGREGATOR_PROVIDERS:
                 normalized_model = normalize_model_for_provider(current_model, resolved_provider)
                 if normalized_model and normalized_model != current_model:
-                    if not self._model_is_default:
-                        self.console.print(
-                            f"[yellow]⚠️  Normalized model '{current_model}' to '{normalized_model}' for {resolved_provider}.[/]"
+                    if (
+                        not self._model_is_default
+                        and not _is_quiet_provider_prefix_normalization(
+                            current_model, normalized_model, resolved_provider
+                        )
+                    ):
+                        _cprint(
+                            f"⚠️  Normalized model '{current_model}' to '{normalized_model}' for {resolved_provider}."
                         )
                     self.model = normalized_model
                     current_model = normalized_model
@@ -2250,9 +2275,14 @@ class HermesCLI:
 
                 canonical = normalize_copilot_model_id(current_model, api_key=self.api_key)
                 if canonical and canonical != current_model:
-                    if not self._model_is_default:
-                        self.console.print(
-                            f"[yellow]⚠️  Normalized Copilot model '{current_model}' to '{canonical}'.[/]"
+                    if (
+                        not self._model_is_default
+                        and not _is_quiet_provider_prefix_normalization(
+                            current_model, canonical, resolved_provider
+                        )
+                    ):
+                        _cprint(
+                            f"⚠️  Normalized Copilot model '{current_model}' to '{canonical}'."
                         )
                     self.model = canonical
                     current_model = canonical
